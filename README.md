@@ -1,0 +1,2 @@
+# BuCoin
+Bucoin Mining App
