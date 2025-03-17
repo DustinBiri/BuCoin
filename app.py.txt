@@ -1,0 +1,248 @@
+from flask import Flask, render_template, jsonify
+import time
+import json
+import os
+import atexit
+
+app = Flask(__name__)
+
+SAVE_FILE = "game_progress.json"
+
+coin_generation_rate = 0.00000011  # Coins per second
+last_coin_update_time = time.time()  # Track last passive earning update
+
+
+# ======= 🛠 GLOBAL VARIABLES =======
+energy = 100
+coins = 0
+inventory = {}
+miner_level = 1
+miner_exp = 0
+last_regen_time = time.time()
+energy_pack_level = 1  # Starts at level 1
+max_energy_pack_level = 5  # Max upgrade level
+energy_pack_upgrade_cost = 50  # Cost to upgrade
+last_mine_time = 0  # Tracks last mining attempt
+
+upgrade_costs = {2: 50, 3: 150, 4: 300}
+miner_max_energy = {1: 100, 2: 150, 3: 200, 4: 300}
+store_items = {
+    "Energy Pack": {"price": 10, "effect": 50},
+    "Pickaxe": {"price": 10, "uses": 20, "multiplier": 2},
+    "Energy Pack Upgrade": {"price": energy_pack_upgrade_cost}
+}
+
+# ======= 🔹 Load Progress from File =======
+def load_progress():
+    global energy, coins, inventory, miner_level, miner_exp, energy_pack_level, last_coin_update_time
+    if os.path.exists(SAVE_FILE):
+        with open(SAVE_FILE, "r") as file:
+            data = json.load(file)
+            energy = data.get("energy", 100)
+            coins = data.get("coins", 0)
+            inventory = data.get("inventory", {})
+            miner_level = data.get("miner_level", 1)
+            miner_exp = data.get("miner_exp", 0)
+            energy_pack_level = data.get("energy_pack_level", 1)
+            last_coin_update_time = data.get("last_coin_update_time", time.time())  # Load last passive update time
+
+
+load_progress()  # ✅ Load progress at startup
+
+# ======= 🔹 Save Progress to File =======
+def save_progress():
+    data = {
+        "energy": energy,
+        "coins": coins,
+        "inventory": inventory,
+        "miner_level": miner_level,
+        "miner_exp": miner_exp,
+        "energy_pack_level": energy_pack_level,
+        "last_coin_update_time": last_coin_update_time  # Save last passive update time
+    }
+    with open(SAVE_FILE, "w") as file:
+        json.dump(data, file)
+
+
+atexit.register(save_progress)  # ✅ Save progress when the server stops
+
+# ======= 🔹 Mine Route =======
+@app.route('/mine', methods=['POST'])
+def mine():
+    global energy, coins, miner_exp, miner_level, inventory, last_mine_time
+    current_time = time.time()
+
+    cooldown_time = max(1, 10 - (miner_level - 1))
+
+    if current_time - last_mine_time < cooldown_time:
+        return jsonify({"message": f"Cooldown active! Wait {round(cooldown_time - (current_time - last_mine_time), 2)} sec"}), 400
+
+    last_mine_time = current_time
+
+    if energy >= 1:
+        energy -= 5
+        earned_coins = 0.5 * miner_level
+
+        if inventory.get("Pickaxe", 0) > 0:
+            earned_coins *= 2
+            inventory["Pickaxe"] -= 1
+            if inventory["Pickaxe"] <= 0:
+                del inventory["Pickaxe"]
+
+        coins = round(coins + earned_coins, 2)
+        miner_exp += 1 * miner_level
+
+        save_progress()  # ✅ Auto-save progress here
+
+        return jsonify({
+            "energy": energy,
+            "coins": coins,
+            "miner_exp": miner_exp,
+            "miner_level": miner_level,
+            "inventory": inventory
+        })
+    else:
+        return jsonify({"message": "Not enough energy!"}), 400
+
+# ======= 🔹 Get Status Route =======
+@app.route('/get_status', methods=['GET'])
+def get_status():
+    global energy, last_regen_time, miner_level, last_coin_update_time, coins
+    current_time = time.time()
+
+    # Calculate passive earnings
+    elapsed_time = current_time - last_coin_update_time
+    earned_coins = elapsed_time * coin_generation_rate
+    coins += earned_coins  # Add passive earnings
+
+    # Update last_coin_update_time
+    last_coin_update_time = current_time
+
+    # Regenerate energy over time
+    elapsed = current_time - last_regen_time
+    regen_amount = int(elapsed // 10)
+    if regen_amount > 0:
+        energy = min(miner_max_energy[miner_level], energy + regen_amount)
+        last_regen_time += regen_amount * 10
+
+    return jsonify({
+        "energy": energy,
+        "coins": round(coins, 9),  # Ensure coins are rounded properly
+        "inventory": inventory,
+        "miner_level": miner_level,
+        "miner_exp": miner_exp,
+        "energy_pack_level": energy_pack_level
+    })
+
+@app.route('/use_energy_pack', methods=['POST'])
+def use_energy_pack():
+    global energy, inventory
+    max_energy = miner_max_energy.get(miner_level, 100)  # Get max energy limit
+
+    if inventory.get("Energy Pack", 0) > 0:
+        restored_energy = store_items["Energy Pack"]["effect"] * energy_pack_level
+        energy = min(max_energy, energy + restored_energy)  # Prevent energy overflow
+
+        inventory["Energy Pack"] -= 1
+        if inventory["Energy Pack"] == 0:
+            del inventory["Energy Pack"]  # Remove empty item
+
+        save_progress()  # ✅ Save changes
+
+        return jsonify({
+            "energy": energy,
+            "inventory": inventory,
+            "coins": round(coins, 9),
+            "miner_exp": miner_exp,
+            "miner_level": miner_level,
+            "message": f"Used an Energy Pack! Restored {restored_energy} energy."
+        })
+    else:
+        return jsonify({"message": "No energy packs left!"}), 400
+
+
+# ======= 🔹 Buy Energy Pack Route =======
+@app.route('/buy_energy_pack', methods=['POST'])
+def buy_energy_pack():
+    global coins, inventory, energy_pack_level
+    price = store_items["Energy Pack"]["price"]
+
+    if coins >= price:
+        coins -= price
+        inventory["Energy Pack"] = inventory.get("Energy Pack", 0) + 1
+
+        save_progress()  # ✅ Auto-save progress
+
+        return jsonify({
+            "coins": coins,
+            "inventory": inventory,
+            "energy": energy,
+            "miner_exp": miner_exp,
+            "miner_level": miner_level
+        })
+    else:
+        return jsonify({"message": "Not enough coins!"}), 400
+
+        # ======= 🔹 Buy Pickaxe Route =======
+@app.route('/buy_pickaxe', methods=['POST'])
+def buy_pickaxe():
+    global coins, inventory
+    item = "Pickaxe"
+    price = store_items[item]["price"]
+
+    if coins >= price:
+        coins -= price
+        inventory[item] = inventory.get(item, 0) + store_items[item]["uses"]
+
+        save_progress()  # ✅ Auto-save progress
+
+        return jsonify({
+            "coins": coins,
+            "inventory": inventory,
+            "energy": energy,
+            "miner_exp": miner_exp,
+            "miner_level": miner_level
+        })
+    else:
+        return jsonify({"message": "Not enough coins!"}), 400
+
+
+# ======= 🔹 Upgrade Miner Route =======
+@app.route('/upgrade_miner', methods=['POST'])
+def upgrade_miner():
+    global miner_level, coins, energy, miner_exp
+    next_level = miner_level + 1
+    required_xp = {
+        1: 500, 2: 1500, 3: 3000, 4: 5000, 5: 7500,
+        6: 10500, 7: 14000, 8: 18000, 9: 22500
+    }.get(miner_level, 25000)
+
+    if miner_level >= 10:
+        return jsonify({"message": "You've reached the max miner level!"}), 400
+
+    if miner_exp >= required_xp and next_level in upgrade_costs and coins >= upgrade_costs[next_level]:
+        coins -= upgrade_costs[next_level]
+        miner_exp -= required_xp
+        miner_level = next_level
+        energy = miner_max_energy[miner_level]
+
+        save_progress()  # ✅ Auto-save progress
+
+        return jsonify({
+            "miner_level": miner_level,
+            "coins": coins,
+            "energy": energy,
+            "miner_exp": miner_exp,
+            "inventory": inventory
+        })
+    else:
+        return jsonify({"message": "Not enough coins or XP to upgrade!"}), 400
+
+# ======= 🔹 Home Page Route =======
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+# ======= 🔹 Run Flask App =======
+if __name__ == '__main__':
+    app.run(debug=True)
